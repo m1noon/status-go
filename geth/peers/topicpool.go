@@ -56,6 +56,13 @@ func (t *TopicPool) MaxReached() bool {
 	return t.connected == t.limits[1]
 }
 
+// BelowMin returns true if current number of peers is below min limit.
+func (t *TopicPool) BelowMin() bool {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.connected < t.limits[0]
+}
+
 // ConfirmAdded called when peer was added by p2p Server
 func (t *TopicPool) ConfirmAdded(server *p2p.Server, nodeID discover.NodeID) {
 	t.mu.Lock()
@@ -74,6 +81,7 @@ func (t *TopicPool) ConfirmAdded(server *p2p.Server, nodeID discover.NodeID) {
 	// when max limit is reached drop every peer after
 	if t.connected == t.limits[1] {
 		log.Debug("max limit is reached drop the peer", "ID", nodeID, "topic", t.topic)
+		peer.requested = true
 		t.removePeer(server, peer)
 		return
 	}
@@ -90,18 +98,17 @@ func (t *TopicPool) ConfirmAdded(server *p2p.Server, nodeID discover.NodeID) {
 }
 
 // ConfirmDropped called when server receives drop event
-func (t *TopicPool) ConfirmDropped(server *p2p.Server, nodeID discover.NodeID, reason string) (new bool) {
+func (t *TopicPool) ConfirmDropped(server *p2p.Server, nodeID discover.NodeID, reason string) (info *peerInfo, ignored bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	// either inbound or connected from another topic
 	peer, exist := t.peers[discv5.NodeID(nodeID)]
 	if !exist {
-		return false
+		return nil, true
 	}
-	log.Debug("disconnect reason", "peer", nodeID, "reason", reason)
-	// if requested - we don't need to remove peer from cache and look for a replacement
-	if reason == p2p.DiscRequested.Error() {
-		return false
+	log.Debug("disconnect reason", "ID", nodeID, "reason", reason)
+	if peer.requested {
+		return nil, true
 	}
 	if t.SearchRunning() && t.connected == t.limits[0] {
 		t.period <- t.fastSync
@@ -118,10 +125,10 @@ func (t *TopicPool) ConfirmDropped(server *p2p.Server, nodeID discover.NodeID, r
 	for _, peer := range t.peers {
 		if !peer.connected && mclock.Now() < peer.discoveredTime+mclock.AbsTime(expirationPeriod) {
 			t.addPeer(server, peer)
-			return true
+			return peer, false
 		}
 	}
-	return false
+	return nil, false
 }
 
 // StartSearch creates discv5 queries and runs a loop to consume found peers.
@@ -137,6 +144,7 @@ func (t *TopicPool) StartSearch(server *p2p.Server) error {
 	atomic.StoreInt32(&t.running, 1)
 	t.quit = make(chan struct{})
 	t.period = make(chan time.Duration, 2)
+	t.quit = make(chan struct{})
 	found := make(chan *discv5.Node, 10)
 	lookup := make(chan bool, 100)
 	if t.cache != nil {
@@ -159,7 +167,11 @@ func (t *TopicPool) StartSearch(server *p2p.Server) error {
 }
 
 func (t *TopicPool) handleFoundPeers(server *p2p.Server, found <-chan *discv5.Node, lookup <-chan bool) {
-	t.period <- t.fastSync
+	if t.connected >= t.limits[0] {
+		t.period <- t.slowSync
+	} else {
+		t.period <- t.fastSync
+	}
 	selfID := discv5.NodeID(server.Self().ID)
 	for {
 		select {
@@ -217,6 +229,9 @@ func (t *TopicPool) removePeer(server *p2p.Server, info *peerInfo) {
 
 // StopSearch stops the closes stop
 func (t *TopicPool) StopSearch() {
+	if !t.SearchRunning() {
+		return
+	}
 	if t.quit == nil {
 		return
 	}
