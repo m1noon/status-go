@@ -2,31 +2,15 @@ package transactions
 
 import (
 	"bytes"
-	"context"
 	"errors"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
+	"github.com/status-im/status-go/geth/rpc"
 )
 
-// errors
-var (
-	ErrInvalidSendTxArgs = errors.New("Transaction arguments are invalid (are both 'input' and 'data' fields used?)")
-)
-
-// Result is a JSON returned from transaction complete function (used internally)
-type Result struct {
-	Hash  common.Hash
-	Error error
-}
-
-// QueuedTx holds enough information to complete the queued transaction.
-type QueuedTx struct {
-	ID      string
-	Context context.Context
-	Args    SendTxArgs
-	Result  chan Result
-}
+// ErrInvalidSendTxArgs is returned when the structure of SendTxArgs is ambigious.
+var ErrInvalidSendTxArgs = errors.New("Transaction arguments are invalid (are both 'input' and 'data' fields used?)")
 
 // SendTxArgs represents the arguments to submit a new transaction into the transaction pool.
 // This struct is based on go-ethereum's type in internal/ethapi/api.go, but we have freedom
@@ -67,4 +51,33 @@ func (args SendTxArgs) GetInput() hexutil.Bytes {
 
 func isNilOrEmpty(bytes hexutil.Bytes) bool {
 	return bytes == nil || len(bytes) == 0
+}
+
+// RPCCalltoSendTxArgs creates SendTxArgs based on RPC parameters
+func RPCCalltoSendTxArgs(args ...interface{}) SendTxArgs {
+	var err error
+	var fromAddr, toAddr common.Address
+
+	rpcCall := rpc.Call{Params: args}
+	fromAddr, err = rpcCall.ParseFromAddress()
+	if err != nil {
+		fromAddr = common.HexToAddress("0x0")
+	}
+
+	toAddr, err = rpcCall.ParseToAddress()
+	if err != nil {
+		toAddr = common.HexToAddress("0x0")
+	}
+
+	input := rpcCall.ParseInput()
+	data := rpcCall.ParseData()
+	return SendTxArgs{
+		To:       &toAddr,
+		From:     fromAddr,
+		Value:    rpcCall.ParseValue(),
+		Input:    input,
+		Data:     data,
+		Gas:      rpcCall.ParseGas(),
+		GasPrice: rpcCall.ParseGasPrice(),
+	}
 }
